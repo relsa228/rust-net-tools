@@ -1,30 +1,70 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::os::unix::io::AsRawFd;
-use std::os::unix::net::{UnixDatagram, UnixListener};
-use std::time::{Duration, Instant};
+use std::env;
+use std::net::{IpAddr, Ipv4Addr};
+use std::process;
+use std::str::FromStr;
+use std::time::Duration;
 
-const TTL: u32 = 64;
-const PACKET_SIZE: usize = 64;
+extern crate pnet;
+use pnet::packet::icmp::{echo_request, IcmpTypes};
+use pnet::packet::ip::IpNextHeaderProtocols;
+use pnet::packet::{MutablePacket, Packet};
+use pnet::transport::{icmp_packet_iter, transport_channel, TransportChannelType};
+
+const DEFAULT_TTL: u8 = 64;
+const DEFAULT_TIMEOUT: u64 = 5;
 
 fn main() {
-    let socket = UnixDatagram::unbound().unwrap();
-    let listener = UnixListener::bind("/tmp/traceroute.sock").unwrap();
-    let mut buffer = [0u8; PACKET_SIZE];
+    let args: Vec<String> = env::args().collect();
+    if args.len() != 2 {
+        eprintln!("Usage: {} <destination>", args[0]);
+        process::exit(1);
+    }
 
-    for ttl in 1..=64 {
-        socket.set_ttl(TTL).unwrap();
-        socket.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    let destination = IpAddr::from_str(&args[1]).unwrap_or_else(|_| {
+        eprintln!("Invalid destination address");
+        process::exit(1);
+    });
 
-        let start_time = Instant::now();
-        socket.send_to(&buffer, SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 33434)).unwrap();
+    let (mut sender, mut receiver) = transport_channel(
+        1024,
+        TransportChannelType::Layer4(pnet::transport::TransportProtocol::Ipv4(IpNextHeaderProtocols::Icmp)),
+    )
+    .unwrap_or_else(|_| {
+        eprintln!("Failed to open transport channel");
+        process::exit(1);
+    });
 
-        let mut response_buffer = [0u8; PACKET_SIZE];
-        match listener.accept() {
-            Ok((mut stream, _)) => {
-                stream.read_exact(&mut response_buffer).unwrap();
-                println!("{}: {:?}", ttl, start_time.elapsed());
+    let mut ttl = 1;
+    loop {
+        sender.set_ttl(ttl).unwrap();
+
+        let mut packet = [0u8; 64];
+        let mut echo_packet = echo_request::MutableEchoRequestPacket::new(&mut packet).unwrap();
+        echo_packet.set_icmp_type(IcmpTypes::EchoRequest);
+        echo_packet.set_sequence_number(ttl as u16);
+        let checksum = pnet::util::checksum(echo_packet.packet(), 1);
+        echo_packet.set_checksum(checksum);
+
+        sender.send_to(echo_packet, destination).unwrap();
+
+        let start_time = std::time::Instant::now();
+        let mut iter = icmp_packet_iter(&mut receiver);
+        let timeout = Duration::from_secs(DEFAULT_TIMEOUT);
+
+        if let Some((packet, addr)) = iter.next_with_timeout(timeout).unwrap() {
+            if packet.get_icmp_type() == IcmpTypes::EchoReply && addr == destination {
+                println!("{} hops max, {} ms", ttl, start_time.elapsed().as_millis());
+                break;
+            } else if packet.get_icmp_type() == IcmpTypes::TimeExceeded {
+                println!("{} {}", ttl, addr);
             }
-            Err(_) => println!("{}: *", ttl),
+        } else {
+            println!("{} *", ttl);
+        }
+
+        ttl += 1;
+        if ttl > DEFAULT_TTL {
+            break;
         }
     }
 }
